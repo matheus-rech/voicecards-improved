@@ -1,0 +1,38 @@
+{
+  "name": "voicecards-improved",
+  "version": "1.0.0",
+  "description": "Voice-powered flashcard app with hands-free mode and AI integrations",
+  "main": "backend/server.js",
+  "scripts": {
+    "dev": "concurrently \"npm run dev:backend\" \"npm run dev:frontend\"",
+    "dev:backend": "nodemon backend/server.js",
+    "dev:frontend": "cd frontend && python3 -m http.server 3000 || python -m http.server 3000",
+    "start": "node backend/server.js",
+    "build": "echo 'Build process - customize as needed'"
+  },
+  "keywords": [
+    "flashcards",
+    "voice",
+    "learning",
+    "spaced-repetition",
+    "pwa"
+  ],
+  "author": "matheus-rech",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "@supabase/supabase-js": "^2.38.4",
+    "bcryptjs": "^2.4.3",
+    "jsonwebtoken": "^9.0.2"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1",
+    "concurrently": "^8.2.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
+
