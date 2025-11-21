@@ -1653,6 +1653,19 @@
                         </label>
                     </div>
                     
+                    <div class="setting-item" style="border-top: 2px solid #e5e7eb; padding-top: 20px; margin-top: 20px;">
+                        <div class="setting-info">
+                            <div class="setting-label">Account</div>
+                            <div class="setting-description" id="accountInfo">
+                                ${AppState.user.authenticated ? `Logged in as ${AppState.user.email}` : 'Not logged in'}
+                            </div>
+                        </div>
+                        ${AppState.user.authenticated ? 
+                            `<button class="control-btn btn-danger" onclick="logout()" style="padding: 8px 20px;">Logout</button>` :
+                            `<button class="control-btn btn-primary" onclick="showLoginModal()" style="padding: 8px 20px;">Login / Register</button>`
+                        }
+                    </div>
+                    
                     <div class="setting-item" id="geminiTTSVoiceContainer" style="display: none;">
                         <div class="setting-info">
                             <div class="setting-label">TTS Voice</div>
@@ -1883,11 +1896,185 @@
     </div>
     
     <script>
+        // API Configuration
+        const API_BASE_URL = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
+            ? 'http://localhost:5000/api'
+            : '/api';
+        
+        // API Service
+        class APIService {
+            constructor() {
+                this.baseURL = API_BASE_URL;
+                this.token = localStorage.getItem('authToken') || null;
+            }
+            
+            setToken(token) {
+                this.token = token;
+                if (token) {
+                    localStorage.setItem('authToken', token);
+                } else {
+                    localStorage.removeItem('authToken');
+                }
+            }
+            
+            async request(endpoint, options = {}) {
+                const url = `${this.baseURL}${endpoint}`;
+                const headers = {
+                    'Content-Type': 'application/json',
+                    ...options.headers
+                };
+                
+                if (this.token) {
+                    headers['Authorization'] = `Bearer ${this.token}`;
+                }
+                
+                try {
+                    const response = await fetch(url, {
+                        ...options,
+                        headers
+                    });
+                    
+                    if (response.status === 401) {
+                        // Token expired or invalid
+                        this.setToken(null);
+                        showLoginModal();
+                        throw new Error('Authentication required');
+                    }
+                    
+                    const data = await response.json();
+                    
+                    if (!response.ok) {
+                        throw new Error(data.error || 'Request failed');
+                    }
+                    
+                    return data;
+                } catch (error) {
+                    console.error('API request failed:', error);
+                    throw error;
+                }
+            }
+            
+            // Auth endpoints
+            async register(email, password, name) {
+                return this.request('/auth/register', {
+                    method: 'POST',
+                    body: JSON.stringify({ email, password, name })
+                });
+            }
+            
+            async login(email, password) {
+                const data = await this.request('/auth/login', {
+                    method: 'POST',
+                    body: JSON.stringify({ email, password })
+                });
+                this.setToken(data.token);
+                return data;
+            }
+            
+            async getCurrentUser() {
+                return this.request('/auth/me');
+            }
+            
+            logout() {
+                this.setToken(null);
+            }
+            
+            // Deck endpoints
+            async getDecks() {
+                return this.request('/decks');
+            }
+            
+            async getPublicDecks() {
+                return this.request('/decks/public');
+            }
+            
+            async getDeck(id) {
+                return this.request(`/decks/${id}`);
+            }
+            
+            async createDeck(name, description, isPublic = false) {
+                return this.request('/decks', {
+                    method: 'POST',
+                    body: JSON.stringify({ name, description, is_public: isPublic })
+                });
+            }
+            
+            async updateDeck(id, updates) {
+                return this.request(`/decks/${id}`, {
+                    method: 'PUT',
+                    body: JSON.stringify(updates)
+                });
+            }
+            
+            async deleteDeck(id) {
+                return this.request(`/decks/${id}`, {
+                    method: 'DELETE'
+                });
+            }
+            
+            // Card endpoints
+            async getCards(deckId) {
+                return this.request(`/cards/deck/${deckId}`);
+            }
+            
+            async getCard(id) {
+                return this.request(`/cards/${id}`);
+            }
+            
+            async createCard(deckId, front, back, pronunciation = '') {
+                return this.request('/cards', {
+                    method: 'POST',
+                    body: JSON.stringify({ deck_id: deckId, front, back, pronunciation })
+                });
+            }
+            
+            async updateCard(id, updates) {
+                return this.request(`/cards/${id}`, {
+                    method: 'PUT',
+                    body: JSON.stringify(updates)
+                });
+            }
+            
+            async deleteCard(id) {
+                return this.request(`/cards/${id}`, {
+                    method: 'DELETE'
+                });
+            }
+            
+            // Session endpoints
+            async getSessions() {
+                return this.request('/sessions');
+            }
+            
+            async createSession(deckId) {
+                return this.request('/sessions', {
+                    method: 'POST',
+                    body: JSON.stringify({ deck_id: deckId })
+                });
+            }
+            
+            async updateSession(id, updates) {
+                return this.request(`/sessions/${id}`, {
+                    method: 'PUT',
+                    body: JSON.stringify(updates)
+                });
+            }
+            
+            // Stats endpoints
+            async getStats() {
+                return this.request('/stats');
+            }
+        }
+        
+        const api = new APIService();
+        
         // Initialize App State
         const AppState = {
             user: {
                 id: null,
-                name: 'Learning Hero',
+                email: null,
+                name: 'Guest',
+                authenticated: false,
                 level: 5,
                 xp: 1250,
                 streak: 0,
@@ -1902,7 +2089,8 @@
                 cardsStudied: 0,
                 correctAnswers: 0,
                 autoAdvance: false,
-                autoPlay: true
+                autoPlay: true,
+                sessionId: null
             },
             decks: {},
             syncStatus: 'synced',
@@ -1910,19 +2098,24 @@
             offlineMode: false
         };
         
-        // Initialize Database (IndexedDB for offline support)
+        // Database class - Uses API with IndexedDB fallback
         class Database {
             constructor() {
                 this.dbName = 'VoiceCardsDB';
                 this.version = 1;
                 this.db = null;
+                this.useAPI = true; // Use API by default, fallback to IndexedDB if offline
             }
             
             async init() {
+                // Initialize IndexedDB for offline fallback
                 return new Promise((resolve, reject) => {
                     const request = indexedDB.open(this.dbName, this.version);
                     
-                    request.onerror = () => reject(request.error);
+                    request.onerror = () => {
+                        console.warn('IndexedDB not available, using API only');
+                        resolve(); // Don't fail, just use API
+                    };
                     request.onsuccess = () => {
                         this.db = request.result;
                         resolve();
@@ -1931,16 +2124,13 @@
                     request.onupgradeneeded = (event) => {
                         const db = event.target.result;
                         
-                        // Create stores
                         if (!db.objectStoreNames.contains('cards')) {
                             const cardStore = db.createObjectStore('cards', { keyPath: 'id' });
                             cardStore.createIndex('deck', 'deck', { unique: false });
-                            cardStore.createIndex('nextReview', 'nextReview', { unique: false });
                         }
                         
                         if (!db.objectStoreNames.contains('sessions')) {
-                            const sessionStore = db.createObjectStore('sessions', { keyPath: 'id', autoIncrement: true });
-                            sessionStore.createIndex('date', 'date', { unique: false });
+                            db.createObjectStore('sessions', { keyPath: 'id', autoIncrement: true });
                         }
                         
                         if (!db.objectStoreNames.contains('settings')) {
@@ -1950,45 +2140,291 @@
                 });
             }
             
-            async saveCard(card) {
-                const transaction = this.db.transaction(['cards'], 'readwrite');
-                const store = transaction.objectStore('cards');
-                return store.put(card);
+            // Check if online
+            isOnline() {
+                return navigator.onLine && this.useAPI && AppState.user.authenticated;
             }
             
-            async getCards(deck) {
+            // Deck methods
+            async getDecks() {
+                if (this.isOnline()) {
+                    try {
+                        return await api.getDecks();
+                    } catch (error) {
+                        console.warn('API failed, using IndexedDB:', error);
+                        return this.getDecksOffline();
+                    }
+                }
+                return this.getDecksOffline();
+            }
+            
+            async getDecksOffline() {
+                if (!this.db) return [];
+                const transaction = this.db.transaction(['settings'], 'readonly');
+                const store = transaction.objectStore('settings');
+                const result = await new Promise((resolve) => {
+                    const request = store.get('decks');
+                    request.onsuccess = () => resolve(request.result?.value || {});
+                });
+                return Object.values(result);
+            }
+            
+            async saveDeck(deck) {
+                if (this.isOnline()) {
+                    try {
+                        if (deck.id) {
+                            return await api.updateDeck(deck.id, deck);
+                        } else {
+                            return await api.createDeck(deck.name, deck.description, deck.is_public);
+                        }
+                    } catch (error) {
+                        console.warn('API failed, saving offline:', error);
+                        return this.saveDeckOffline(deck);
+                    }
+                }
+                return this.saveDeckOffline(deck);
+            }
+            
+            async saveDeckOffline(deck) {
+                if (!this.db) return deck;
+                const decks = await this.getDecksOffline();
+                if (deck.id) {
+                    const index = decks.findIndex(d => d.id === deck.id);
+                    if (index >= 0) decks[index] = deck;
+                    else decks.push(deck);
+                } else {
+                    deck.id = Date.now().toString();
+                    decks.push(deck);
+                }
+                const transaction = this.db.transaction(['settings'], 'readwrite');
+                const store = transaction.objectStore('settings');
+                await store.put({ key: 'decks', value: Object.fromEntries(decks.map(d => [d.id, d])) });
+                return deck;
+            }
+            
+            async deleteDeck(deckId) {
+                if (this.isOnline()) {
+                    try {
+                        await api.deleteDeck(deckId);
+                        return;
+                    } catch (error) {
+                        console.warn('API failed, deleting offline:', error);
+                    }
+                }
+                await this.deleteDeckOffline(deckId);
+            }
+            
+            async deleteDeckOffline(deckId) {
+                if (!this.db) return;
+                const decks = await this.getDecksOffline();
+                const filtered = decks.filter(d => d.id !== deckId);
+                const transaction = this.db.transaction(['settings'], 'readwrite');
+                const store = transaction.objectStore('settings');
+                await store.put({ key: 'decks', value: Object.fromEntries(filtered.map(d => [d.id, d])) });
+            }
+            
+            // Card methods
+            async getCards(deckId) {
+                if (this.isOnline()) {
+                    try {
+                        return await api.getCards(deckId);
+                    } catch (error) {
+                        console.warn('API failed, using IndexedDB:', error);
+                        return this.getCardsOffline(deckId);
+                    }
+                }
+                return this.getCardsOffline(deckId);
+            }
+            
+            async getCardsOffline(deckId) {
+                if (!this.db) return [];
                 const transaction = this.db.transaction(['cards'], 'readonly');
                 const store = transaction.objectStore('cards');
                 const index = store.index('deck');
                 return new Promise((resolve) => {
-                    const request = index.getAll(deck);
-                    request.onsuccess = () => resolve(request.result);
+                    const request = index.getAll(deckId);
+                    request.onsuccess = () => resolve(request.result || []);
+                    request.onerror = () => resolve([]);
                 });
             }
             
-            async getAllCards() {
-                const transaction = this.db.transaction(['cards'], 'readonly');
+            async saveCard(card) {
+                if (this.isOnline()) {
+                    try {
+                        if (card.id && !card.id.startsWith('temp_')) {
+                            return await api.updateCard(card.id, {
+                                front: card.front,
+                                back: card.back,
+                                pronunciation: card.pronunciation
+                            });
+                        } else {
+                            return await api.createCard(card.deck_id || card.deck, card.front, card.back, card.pronunciation || '');
+                        }
+                    } catch (error) {
+                        console.warn('API failed, saving offline:', error);
+                        return this.saveCardOffline(card);
+                    }
+                }
+                return this.saveCardOffline(card);
+            }
+            
+            async saveCardOffline(card) {
+                if (!this.db) return card;
+                if (!card.id) card.id = 'temp_' + Date.now();
+                const transaction = this.db.transaction(['cards'], 'readwrite');
                 const store = transaction.objectStore('cards');
-                return new Promise((resolve) => {
-                    const request = store.getAll();
-                    request.onsuccess = () => resolve(request.result);
-                });
+                await store.put(card);
+                return card;
             }
             
             async deleteCard(cardId) {
+                if (this.isOnline()) {
+                    try {
+                        await api.deleteCard(cardId);
+                        return;
+                    } catch (error) {
+                        console.warn('API failed, deleting offline:', error);
+                    }
+                }
+                await this.deleteCardOffline(cardId);
+            }
+            
+            async deleteCardOffline(cardId) {
+                if (!this.db) return;
                 const transaction = this.db.transaction(['cards'], 'readwrite');
                 const store = transaction.objectStore('cards');
-                return store.delete(cardId);
+                await store.delete(cardId);
             }
             
             async saveSession(session) {
+                if (this.isOnline() && session.deck_id) {
+                    try {
+                        if (session.id) {
+                            await api.updateSession(session.id, {
+                                ended_at: session.ended_at,
+                                cards_studied: session.cardsStudied,
+                                cards_correct: session.correctAnswers
+                            });
+                        } else {
+                            const result = await api.createSession(session.deck_id);
+                            session.id = result.id;
+                        }
+                        return session;
+                    } catch (error) {
+                        console.warn('API failed, saving offline:', error);
+                    }
+                }
+                return this.saveSessionOffline(session);
+            }
+            
+            async saveSessionOffline(session) {
+                if (!this.db) return session;
+                if (!session.id) session.id = Date.now();
                 const transaction = this.db.transaction(['sessions'], 'readwrite');
                 const store = transaction.objectStore('sessions');
-                return store.add(session);
+                await store.add(session);
+                return session;
             }
         }
         
         const db = new Database();
+        
+        // Auth functions
+        let currentAuthTab = 'login';
+        
+        function showAuthTab(tab) {
+            currentAuthTab = tab;
+            document.getElementById('loginTab').style.borderBottom = tab === 'login' ? '2px solid var(--primary)' : 'none';
+            document.getElementById('loginTab').style.color = tab === 'login' ? 'var(--primary)' : 'var(--gray)';
+            document.getElementById('loginTab').style.fontWeight = tab === 'login' ? '600' : '400';
+            document.getElementById('registerTab').style.borderBottom = tab === 'register' ? '2px solid var(--primary)' : 'none';
+            document.getElementById('registerTab').style.color = tab === 'register' ? 'var(--primary)' : 'var(--gray)';
+            document.getElementById('registerTab').style.fontWeight = tab === 'register' ? '600' : '400';
+            
+            document.getElementById('nameField').style.display = tab === 'register' ? 'block' : 'none';
+            document.getElementById('authModalTitle').textContent = tab === 'login' ? 'Login' : 'Register';
+            document.getElementById('authSubmitText').textContent = tab === 'login' ? 'Login' : 'Register';
+            document.getElementById('authError').style.display = 'none';
+        }
+        
+        async function handleAuth(event) {
+            event.preventDefault();
+            const email = document.getElementById('authEmail').value;
+            const password = document.getElementById('authPassword').value;
+            const name = document.getElementById('authName').value;
+            const errorDiv = document.getElementById('authError');
+            
+            try {
+                let result;
+                if (currentAuthTab === 'register') {
+                    result = await api.register(email, password, name);
+                    showToast('Account created! Please login.', 'success');
+                    showAuthTab('login');
+                } else {
+                    result = await api.login(email, password);
+                    AppState.user = {
+                        ...AppState.user,
+                        id: result.user.id,
+                        email: result.user.email,
+                        name: result.user.name || result.user.email.split('@')[0],
+                        authenticated: true
+                    };
+                    closeAuthModal();
+                    showToast('Welcome back!', 'success');
+                    await loadUserData();
+                }
+            } catch (error) {
+                errorDiv.textContent = error.message || 'Authentication failed';
+                errorDiv.style.display = 'block';
+            }
+        }
+        
+        function showLoginModal() {
+            document.getElementById('authModal').style.display = 'flex';
+            showAuthTab('login');
+        }
+        
+        function closeAuthModal() {
+            document.getElementById('authModal').style.display = 'none';
+            document.getElementById('authForm').reset();
+            document.getElementById('authError').style.display = 'none';
+        }
+        
+        async function logout() {
+            api.logout();
+            AppState.user = {
+                ...AppState.user,
+                id: null,
+                email: null,
+                name: 'Guest',
+                authenticated: false
+            };
+            AppState.decks = {};
+            showToast('Logged out', 'info');
+            renderDecks();
+            showLoginModal();
+        }
+        
+        async function loadUserData() {
+            if (!AppState.user.authenticated) return;
+            
+            try {
+                const decks = await db.getDecks();
+                AppState.decks = {};
+                decks.forEach(deck => {
+                    AppState.decks[deck.id] = {
+                        id: deck.id,
+                        name: deck.name,
+                        description: deck.description,
+                        isPublic: deck.is_public,
+                        cards: []
+                    };
+                });
+                renderDecks();
+            } catch (error) {
+                console.error('Failed to load user data:', error);
+            }
+        }
         
         // Speech Recognition & Synthesis
         class VoiceEngine {
@@ -3744,6 +4180,32 @@ When user wants to repeat, use repeat_card tool.`;
                 loadingScreen.style.display = 'none';
             }
             
+            // Initialize database
+            await db.init();
+            
+            // Check authentication
+            if (api.token) {
+                try {
+                    const userData = await api.getCurrentUser();
+                    AppState.user = {
+                        ...AppState.user,
+                        id: userData.user.id,
+                        email: userData.user.email,
+                        name: userData.user.name || userData.user.email.split('@')[0],
+                        authenticated: true
+                    };
+                    await loadUserData();
+                } catch (error) {
+                    console.warn('Auth check failed:', error);
+                    api.logout();
+                }
+            }
+            
+            // Show login if not authenticated
+            if (!AppState.user.authenticated) {
+                showLoginModal();
+            }
+            
             // Show UI immediately
             const hasOnboarded = localStorage.getItem('hasOnboarded');
             const voiceOnboarding = localStorage.getItem('voiceOnboarding') === 'true';
@@ -3757,9 +4219,6 @@ When user wants to repeat, use repeat_card tool.`;
             // Initialize in background (non-blocking)
             (async () => {
                 try {
-                    // Initialize database
-                    await db.init();
-                    
                     // Load saved settings
                     loadSettings();
                     
@@ -4518,32 +4977,78 @@ When user wants to repeat, use repeat_card tool.`;
         }
         
         async function createNewDeck() {
-            const deckName = document.getElementById('newDeckName').value.trim().toLowerCase().replace(/\s+/g, '-');
+            const deckName = document.getElementById('newDeckName').value.trim();
             if (!deckName) {
                 showToast('Please enter a deck name', 'error');
                 return;
             }
             
-            if (AppState.decks[deckName]) {
-                showToast('Deck already exists!', 'error');
+            if (!AppState.user.authenticated) {
+                showToast('Please login to create decks', 'error');
+                showLoginModal();
                 return;
             }
             
-            AppState.decks[deckName] = [];
-            closeModal('createDeckModal');
-            showToast(`Deck "${deckName}" created!`, 'success');
-            renderDecks();
+            try {
+                const deck = await db.saveDeck({
+                    name: deckName,
+                    description: '',
+                    is_public: false
+                });
+                
+                AppState.decks[deck.id] = {
+                    id: deck.id,
+                    name: deck.name,
+                    description: deck.description || '',
+                    isPublic: deck.is_public || false,
+                    cards: []
+                };
+                
+                document.getElementById('newDeckName').value = '';
+                closeModal('createDeckModal');
+                showToast(`Deck "${deckName}" created!`, 'success');
+                await renderDecks();
+            } catch (error) {
+                console.error('Failed to create deck:', error);
+                showToast('Failed to create deck: ' + error.message, 'error');
+            }
         }
         
-        function renderDecks() {
+        async function renderDecks() {
             const decksList = document.getElementById('decksList');
             if (!decksList) return;
             
             decksList.innerHTML = '';
             
-            for (const [deckName, cards] of Object.entries(AppState.decks)) {
+            // Show login prompt if not authenticated
+            if (!AppState.user.authenticated) {
+                decksList.innerHTML = `
+                    <div class="feature-card" style="text-align: center; padding: 40px;">
+                        <h3 style="margin-bottom: 15px;">Please login to access your decks</h3>
+                        <button class="control-btn btn-primary" onclick="showLoginModal()">Login / Register</button>
+                    </div>
+                `;
+                return;
+            }
+            
+            // Load decks if empty
+            if (Object.keys(AppState.decks).length === 0) {
+                await loadUserData();
+            }
+            
+            for (const [deckId, deck] of Object.entries(AppState.decks)) {
+                // Load cards for this deck
+                if (!deck.cards || deck.cards.length === 0) {
+                    try {
+                        deck.cards = await db.getCards(deckId);
+                    } catch (error) {
+                        console.error('Failed to load cards:', error);
+                        deck.cards = [];
+                    }
+                }
+                
                 const now = new Date();
-                const dueCount = cards.filter(card => {
+                const dueCount = deck.cards.filter(card => {
                     if (!card.nextReview) return true;
                     return new Date(card.nextReview) <= now;
                 }).length;
@@ -4553,25 +5058,39 @@ When user wants to repeat, use repeat_card tool.`;
                 deckCard.style.cursor = 'pointer';
                 deckCard.innerHTML = `
                     <div style="display: flex; justify-content: space-between; align-items: start; margin-bottom: 15px;">
-                        <h3 style="margin: 0; font-size: 20px;">${deckName.charAt(0).toUpperCase() + deckName.slice(1)}</h3>
-                        <span style="background: var(--primary); color: white; padding: 4px 12px; border-radius: 12px; font-size: 12px;">${cards.length} cards</span>
+                        <div>
+                            <h3 style="margin: 0; font-size: 20px;">${deck.name}</h3>
+                            ${deck.description ? `<p style="color: var(--gray); font-size: 14px; margin: 5px 0 0 0;">${deck.description}</p>` : ''}
+                        </div>
+                        <span style="background: var(--primary); color: white; padding: 4px 12px; border-radius: 12px; font-size: 12px;">${deck.cards.length} cards</span>
                     </div>
                     <div style="color: var(--gray); font-size: 14px; margin-bottom: 15px;">
                         ${dueCount} cards due for review
                     </div>
                     <div style="display: flex; gap: 10px; flex-wrap: wrap;">
-                        <button class="control-btn btn-primary" style="flex: 1; padding: 8px;" onclick="startSession('${deckName}')">
+                        <button class="control-btn btn-primary" style="flex: 1; padding: 8px;" onclick="startSession('${deckId}')">
                             Study
                         </button>
-                        <button class="control-btn btn-secondary" style="flex: 1; padding: 8px;" onclick="editDeck('${deckName}')">
+                        <button class="control-btn btn-secondary" style="flex: 1; padding: 8px;" onclick="editDeck('${deckId}')">
                             Edit
                         </button>
-                        <button class="control-btn btn-secondary" style="padding: 8px;" onclick="exportDeck('${deckName}')" title="Export">
+                        <button class="control-btn btn-secondary" style="padding: 8px;" onclick="exportDeck('${deckId}')" title="Export">
                             📤
                         </button>
                     </div>
                 `;
                 decksList.appendChild(deckCard);
+            }
+            
+            // Show empty state
+            if (Object.keys(AppState.decks).length === 0) {
+                decksList.innerHTML = `
+                    <div class="feature-card" style="text-align: center; padding: 40px;">
+                        <h3 style="margin-bottom: 15px;">No decks yet</h3>
+                        <p style="color: var(--gray); margin-bottom: 20px;">Create your first deck to get started!</p>
+                        <button class="control-btn btn-primary" onclick="showModal('createDeckModal')">Create Deck</button>
+                    </div>
+                `;
             }
         }
         
@@ -4648,27 +5167,178 @@ When user wants to repeat, use repeat_card tool.`;
                 return;
             }
             
-            const deckName = AppState.editingCardDeck;
+            const deckId = AppState.editingCardDeck;
             
-            if (AppState.editingCard) {
-                // Update existing card
-                AppState.editingCard.front = front;
-                AppState.editingCard.back = back;
-                AppState.editingCard.pronunciation = pronunciation;
-                await db.saveCard(AppState.editingCard);
-                showToast('Card updated!', 'success');
-            } else {
-                // Create new card
-                const newCard = {
-                    id: Date.now(),
-                    front,
-                    back,
-                    pronunciation,
-                    deck: deckName,
-                    nextReview: null,
-                    repetitions: 0,
-                    easeFactor: 2.5,
-                    interval: 1
+            if (!deckId) {
+                showToast('No deck selected', 'error');
+                return;
+            }
+            
+            try {
+                if (AppState.editingCard) {
+                    // Update existing card
+                    const updatedCard = await db.saveCard({
+                        id: AppState.editingCard.id,
+                        front,
+                        back,
+                        pronunciation,
+                        deck_id: deckId
+                    });
+                    
+                    // Update local state
+                    const deck = AppState.decks[deckId];
+                    if (deck && deck.cards) {
+                        const index = deck.cards.findIndex(c => c.id === updatedCard.id);
+                        if (index >= 0) {
+                            deck.cards[index] = updatedCard;
+                        }
+                    }
+                    
+                    showToast('Card updated!', 'success');
+                } else {
+                    // Create new card
+                    const newCard = await db.saveCard({
+                        front,
+                        back,
+                        pronunciation,
+                        deck_id: deckId
+                    });
+                    
+                    // Add to local state
+                    if (!AppState.decks[deckId]) {
+                        AppState.decks[deckId] = { id: deckId, cards: [] };
+                    }
+                    if (!AppState.decks[deckId].cards) {
+                        AppState.decks[deckId].cards = [];
+                    }
+                    AppState.decks[deckId].cards.push(newCard);
+                    
+                    showToast('Card created!', 'success');
+                }
+                
+                closeModal('cardEditorModal');
+                if (AppState.editingDeck === deckId) {
+                    renderDeckEditor(deckId);
+                }
+            } catch (error) {
+                console.error('Failed to save card:', error);
+                showToast('Failed to save card: ' + error.message, 'error');
+            }
+        }
+        
+        async function deleteCurrentCard() {
+            if (!AppState.editingCard || !AppState.editingCard.id) {
+                showToast('No card selected', 'error');
+                return;
+            }
+            
+            if (!confirm('Are you sure you want to delete this card?')) {
+                return;
+            }
+            
+            try {
+                await db.deleteCard(AppState.editingCard.id);
+                
+                // Remove from local state
+                const deckId = AppState.editingCardDeck;
+                if (AppState.decks[deckId] && AppState.decks[deckId].cards) {
+                    AppState.decks[deckId].cards = AppState.decks[deckId].cards.filter(
+                        c => c.id !== AppState.editingCard.id
+                    );
+                }
+                
+                closeModal('cardEditorModal');
+                if (AppState.editingDeck === deckId) {
+                    renderDeckEditor(deckId);
+                }
+                showToast('Card deleted', 'success');
+            } catch (error) {
+                console.error('Failed to delete card:', error);
+                showToast('Failed to delete card: ' + error.message, 'error');
+            }
+        }
+        
+        function editDeck(deckId) {
+            AppState.editingDeck = deckId;
+            showSection('study');
+            const deck = AppState.decks[deckId];
+            showToast(`Editing ${deck?.name || 'deck'} - Click cards to edit`, 'info');
+            renderDeckEditor(deckId);
+        }
+        
+        async function renderDeckEditor(deckId) {
+            const mainContent = document.querySelector('.main-content');
+            if (!mainContent) return;
+            
+            const deck = AppState.decks[deckId];
+            if (!deck) {
+                mainContent.innerHTML = '<p>Deck not found</p>';
+                return;
+            }
+            
+            // Load cards if not loaded
+            if (!deck.cards || deck.cards.length === 0) {
+                try {
+                    deck.cards = await db.getCards(deckId);
+                } catch (error) {
+                    console.error('Failed to load cards:', error);
+                    deck.cards = [];
+                }
+            }
+            
+            const cards = deck.cards || [];
+            
+            mainContent.innerHTML = `
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px;">
+                    <div style="display: flex; align-items: center; gap: 15px;">
+                        <button class="control-btn btn-secondary" onclick="showSection('decks')" style="padding: 8px 15px;">
+                            ← Back
+                        </button>
+                        <h2 style="margin: 0;">Edit Deck: ${deck.name}</h2>
+                    </div>
+                    <button class="control-btn btn-primary" onclick="addNewCard('${deckId}')">
+                        <span>➕</span> Add Card
+                    </button>
+                </div>
+                <div id="cardsList" style="display: grid; gap: 15px;">
+                    ${cards.length === 0 ? '<p style="text-align: center; color: var(--gray); padding: 40px;">No cards yet. Click "Add Card" to get started!</p>' : cards.map(card => `
+                        <div class="feature-card" onclick="editCard('${card.id}', '${deckId}')" style="cursor: pointer;">
+                            <div style="font-weight: 600; margin-bottom: 8px;">${card.front}</div>
+                            <div style="color: var(--gray); font-size: 14px;">${card.back}</div>
+                            ${card.pronunciation ? `<div style="color: var(--primary); font-size: 12px; margin-top: 5px;">${card.pronunciation}</div>` : ''}
+                        </div>
+                    `).join('')}
+                </div>
+            `;
+        }
+        
+        function addNewCard(deckId) {
+            AppState.editingCard = null;
+            AppState.editingCardDeck = deckId;
+            document.getElementById('cardEditorTitle').textContent = 'Add New Card';
+            document.getElementById('cardFrontInput').value = '';
+            document.getElementById('cardBackInput').value = '';
+            document.getElementById('cardPronInput').value = '';
+            document.getElementById('deleteCardBtn').style.display = 'none';
+            showModal('cardEditorModal');
+        }
+        
+        function editCard(cardId, deckId) {
+            const deck = AppState.decks[deckId];
+            if (!deck || !deck.cards) return;
+            
+            const card = deck.cards.find(c => c.id === cardId || c.id === cardId.toString());
+            if (!card) return;
+            
+            AppState.editingCard = card;
+            AppState.editingCardDeck = deckId;
+            document.getElementById('cardEditorTitle').textContent = 'Edit Card';
+            document.getElementById('cardFrontInput').value = card.front;
+            document.getElementById('cardBackInput').value = card.back;
+            document.getElementById('cardPronInput').value = card.pronunciation || '';
+            document.getElementById('deleteCardBtn').style.display = 'block';
+            showModal('cardEditorModal');
+        }
                 };
                 
                 if (!AppState.decks[deckName]) {
